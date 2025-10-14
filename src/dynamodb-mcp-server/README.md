@@ -146,3 +146,32 @@ or docker after a successful `docker build -t awslabs/dynamodb-mcp-server .`:
     }
   }
 ```
+
+## AWS AgentCore Deployment
+
+You can deploy this MCP server directly to the cloud using AWS Bedrock AgentCore platform:
+
+### Install Deployment Tools
+
+Install the Amazon Bedrock AgentCore CLI, which will handle all deployment steps:
+
+```bash
+pip install bedrock-agentcore-starter-toolkit
+```
+
+### Deploy to AgentCore Runtime
+
+With the AgentCore tool installed, deploy the MCP server using:
+
+```bash
+agentcore launch
+```
+
+This command will:
+
+- Build a Docker container with your agent
+- Push it to Amazon ECR
+- Create an Amazon Bedrock AgentCore runtime
+- Deploy your agent to AWS
+
+The deployment provides a scalable, cloud-native way to run your DynamoDB MCP server with full AWS integration and monitoring capabilities perfect for hackathon development and testing.
