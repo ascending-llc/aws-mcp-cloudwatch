@@ -100,6 +100,14 @@ jobs:
           echo "Updating env vars in EKS pods..."
           kubectl annotate es jarvis-env force-sync=$(date +%s) --overwrite -n ${{ inputs.application }}
 
+      - name: Apply deployment manifest
+        run: |
+          # Using no-auth deployment for testing
+          kubectl apply -f k8s/jarvis-demo/deployment-no-auth.yaml
+
+          # Uncomment below when auth is implemented and comment out no-auth above
+          # kubectl apply -f k8s/jarvis-demo/deployment.yaml
+
       - name: Update deployment on EKS
         env:
           image: ${{ steps.login-ecr.outputs.registry }}/jarvis/cloudwatch_mcp_server:${{ inputs.version }}
