@@ -44,7 +44,7 @@ spec:
             # AWS Credentials - Use your existing user credentials
             # Option 1: Use AWS Profile (if credentials mounted as secret)
             - name: AWS_PROFILE
-              value: "default"  # Or your profile name
+              value: "saas"  # Using saas profile (account 897729109735)
 
             # Option 2: Use access keys directly (uncomment if using)
             # - name: AWS_ACCESS_KEY_ID

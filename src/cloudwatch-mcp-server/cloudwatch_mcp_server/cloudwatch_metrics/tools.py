@@ -383,7 +383,6 @@ class CloudWatchMetricsTools:
 
         except Exception as e:
             logger.error(f'Error in get_metric_data: {str(e)}')
-            await ctx.error(f'Error getting metric data: {str(e)}')
             raise
 
     def _prepare_time_parameters(self, start_time, end_time, target_datapoints):
@@ -668,7 +667,6 @@ class CloudWatchMetricsTools:
 
         except Exception as e:
             logger.error(f'Error in get_metric_metadata: {str(e)}')
-            await ctx.error(f'Error getting metric metadata: {str(e)}')
             raise
 
     async def get_recommended_metric_alarms(
@@ -763,7 +761,6 @@ class CloudWatchMetricsTools:
 
         except Exception as e:
             logger.error(f'Error in get_recommended_metric_alarms: {str(e)}')
-            await ctx.error(f'Error getting alarm recommendations: {str(e)}')
             raise
 
     def _alarm_matches_dimensions(

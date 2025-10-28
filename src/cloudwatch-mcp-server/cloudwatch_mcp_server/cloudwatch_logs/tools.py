@@ -351,7 +351,6 @@ class CloudWatchLogsTools:
 
         except Exception as e:
             logger.error(f'Error in describe_log_groups_tool: {str(e)}')
-            await ctx.error(f'Error in describing log groups: {str(e)}')
             raise
 
     async def analyze_log_group(
@@ -498,7 +497,6 @@ class CloudWatchLogsTools:
 
         except Exception as e:
             logger.error(f'Error in analyze_log_group_tool: {str(e)}')
-            await ctx.error(f'Error analyzing log group: {str(e)}')
             raise
 
     async def execute_log_insights_query(
@@ -597,7 +595,6 @@ class CloudWatchLogsTools:
 
         except Exception as e:
             logger.error(f'Error in execute_log_insights_query_tool: {str(e)}')
-            await ctx.error(f'Error executing CloudWatch Logs Insights query: {str(e)}')
             raise
 
     async def get_logs_insight_query_results(
@@ -636,7 +633,6 @@ class CloudWatchLogsTools:
             return self._process_query_results(response, query_id)
         except Exception as e:
             logger.error(f'Error in get_query_results_tool: {str(e)}')
-            await ctx.error(f'Error retrieving CloudWatch Logs Insights query results: {str(e)}')
             raise
 
     async def cancel_logs_insight_query(
@@ -668,5 +664,4 @@ class CloudWatchLogsTools:
             return LogsQueryCancelResult.model_validate(response)
         except Exception as e:
             logger.error(f'Error in cancel_query_tool: {str(e)}')
-            await ctx.error(f'Error cancelling CloudWatch Logs Insights query: {str(e)}')
             raise

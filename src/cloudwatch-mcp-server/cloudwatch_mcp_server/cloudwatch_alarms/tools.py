@@ -203,7 +203,6 @@ class CloudWatchAlarmsTools:
 
         except Exception as e:
             logger.error(f'Error in get_active_alarms: {str(e)}')
-            await ctx.error(f'Error getting active alarms: {str(e)}')
             raise
 
     async def get_alarm_history(
@@ -370,7 +369,6 @@ class CloudWatchAlarmsTools:
 
         except Exception as e:
             logger.error(f'Error in get_alarm_history: {str(e)}')
-            await ctx.error(f'Error getting alarm history: {str(e)}')
             raise
 
     def _transform_metric_alarm(self, alarm: Dict[str, Any]) -> MetricAlarmSummary:
