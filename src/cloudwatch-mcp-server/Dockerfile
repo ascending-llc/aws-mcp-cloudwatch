@@ -1,17 +1,3 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 # dependabot should continue to update this to the latest hash.
 FROM public.ecr.aws/docker/library/python:3.13.5-alpine3.21@sha256:c9a09c45a4bcc618c7f7128585b8dd0d41d0c31a8a107db4c8255ffe0b69375d AS uv
 
@@ -65,7 +51,16 @@ FROM public.ecr.aws/docker/library/python:3.13.5-alpine3.21@sha256:c9a09c45a4bcc
 
 # Place executables in the environment at the front of the path and include other binaries
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    CLOUDWATCH_MCP_PORT=3334 \
+    CLOUDWATCH_MCP_SERVER_HOST=0.0.0.0 \
+    PYTHONPATH="/app" \
+    VIRTUAL_ENV="/app/.venv" \
+    FASTMCP_HTTP_HOST=0.0.0.0 \
+    FASTMCP_HTTP_PORT=3334
+
+
+EXPOSE 3334
 
 # Install runtime dependencies and create application user
 RUN apk update && \
@@ -75,14 +70,9 @@ RUN apk update && \
     adduser -S app -G app -h /app
 
 # Copy application artifacts from build stage
-COPY --from=uv --chown=app:app /app/.venv /app/.venv
-
-# Get healthcheck script
-COPY ./docker-healthcheck.sh /usr/local/bin/docker-healthcheck.sh
+COPY --from=uv --chown=app:app /app /app
 
 # Run as non-root
 USER app
 
-# When running the container, add --db-path and a bind mount to the host's db file
-HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 CMD ["docker-healthcheck.sh"]
-ENTRYPOINT ["awslabs.cloudwatch-mcp-server"]
+CMD ["python", "-m", "cloudwatch_mcp_server.server"]

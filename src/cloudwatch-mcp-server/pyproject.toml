@@ -1,5 +1,5 @@
 [project]
-name = "awslabs.cloudwatch-mcp-server"
+name = "cloudwatch-mcp-server"
 version = "0.0.10"
 description = "An AWS Labs Model Context Protocol (MCP) server for cloudwatch"
 readme = "README.md"
@@ -7,8 +7,12 @@ requires-python = ">=3.10"
 dependencies = [
     "boto3>=1.38.22",
     "loguru>=0.7.0",
+    "fastmcp>=2.12.5",
     "mcp[cli]>=1.11.0",
     "pydantic>=2.10.6",
+    "pyjwt[crypto]>=2.8.0",
+    "python-jose[cryptography]>=3.3.0",
+    "cryptography>=42.0.0",
 ]
 license = {text = "Apache-2.0"}
 license-files = ["LICENSE", "NOTICE" ]
