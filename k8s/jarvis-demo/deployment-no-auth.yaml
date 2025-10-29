@@ -75,6 +75,10 @@ spec:
             - name: FASTMCP_LOG_LEVEL
               value: "INFO"
 
+            # Set HOME for boto3 to find AWS credentials
+            - name: HOME
+              value: "/home/app"
+
           # Mount AWS credentials (if using AWS_PROFILE method)
           volumeMounts:
             - name: aws-credentials
@@ -120,7 +124,7 @@ spec:
       volumes:
         - name: aws-credentials
           secret:
-            secretName: aws-credentials
+            secretName: aws-credentials  # pragma: allowlist secret
             optional: true  # Make optional if using access keys instead
 
 ---
