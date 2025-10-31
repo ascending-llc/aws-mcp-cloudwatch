@@ -1,10 +1,18 @@
 import os
+
+from loguru import logger
+
+from fastmcp import FastMCP
+
 from cloudwatch_mcp_server.cloudwatch_alarms.tools import CloudWatchAlarmsTools
 from cloudwatch_mcp_server.cloudwatch_logs.tools import CloudWatchLogsTools
 from cloudwatch_mcp_server.cloudwatch_metrics.tools import CloudWatchMetricsTools
-from cloudwatch_mcp_server.middleware import BrowserCredentialsMiddleware
-from fastmcp import FastMCP
-from loguru import logger
+
+try:
+    from cloudwatch_mcp_server.middleware import BrowserCredentialsMiddleware
+except ImportError:  # pragma: no cover - defensive for slim builds
+    BrowserCredentialsMiddleware = None
+    logger.warning("BrowserCredentialsMiddleware unavailable; authentication middleware disabled")
 
 
 mcp = FastMCP(
@@ -16,9 +24,11 @@ mcp = FastMCP(
 # Set ENABLE_AUTH=false for local development without authentication
 enable_auth = os.getenv('ENABLE_AUTH', 'true').lower() == 'true'
 
-if enable_auth:
+if enable_auth and BrowserCredentialsMiddleware:
     mcp.add_middleware(BrowserCredentialsMiddleware(mcp, enable_auth=True))
     logger.info('Browser credentials authentication enabled')
+elif enable_auth:
+    logger.warning('Authentication requested but BrowserCredentialsMiddleware is unavailable; continuing without auth')
 else:
     logger.info('Authentication disabled; middleware not installed')
 
