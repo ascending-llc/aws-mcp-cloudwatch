@@ -13,6 +13,9 @@ dependencies = [
     "pyjwt[crypto]>=2.8.0",
     "python-jose[cryptography]>=3.3.0",
     "cryptography>=42.0.0",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "python-multipart>=0.0.6",
 ]
 license = {text = "Apache-2.0"}
 license-files = ["LICENSE", "NOTICE" ]

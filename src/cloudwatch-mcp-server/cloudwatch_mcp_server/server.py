@@ -1,36 +1,18 @@
 import os
-
-from loguru import logger
-
-from fastmcp import FastMCP
-
 from cloudwatch_mcp_server.cloudwatch_alarms.tools import CloudWatchAlarmsTools
 from cloudwatch_mcp_server.cloudwatch_logs.tools import CloudWatchLogsTools
 from cloudwatch_mcp_server.cloudwatch_metrics.tools import CloudWatchMetricsTools
+from fastmcp import FastMCP
+from loguru import logger
 
-try:
-    from cloudwatch_mcp_server.middleware import BrowserCredentialsMiddleware
-except ImportError:  # pragma: no cover - defensive for slim builds
-    BrowserCredentialsMiddleware = None
-    logger.warning("BrowserCredentialsMiddleware unavailable; authentication middleware disabled")
 
+# Authentication middleware archived in _future_auth/ - not currently used
+# Production uses IRSA (IAM Roles for Service Accounts) for AWS authentication
 
 mcp = FastMCP(
     'cloudwatch-mcp-server',
     instructions='Use this MCP server to run read-only commands and analyze CloudWatch Logs, Metrics, and Alarms. Supports discovering log groups, running CloudWatch Log Insight Queries, retrieving CloudWatch Metrics information, and getting active alarms with region information. With CloudWatch Logs Insights, you can interactively search and analyze your log data. With CloudWatch Metrics, you can get information about system and application metrics. With CloudWatch Alarms, you can retrieve all currently active alarms for operational awareness, with clear indication of which AWS region was checked.',
 )
-
-# Add authentication middleware
-# Set ENABLE_AUTH=false for local development without authentication
-enable_auth = os.getenv('ENABLE_AUTH', 'true').lower() == 'true'
-
-if enable_auth and BrowserCredentialsMiddleware:
-    mcp.add_middleware(BrowserCredentialsMiddleware(mcp, enable_auth=True))
-    logger.info('Browser credentials authentication enabled')
-elif enable_auth:
-    logger.warning('Authentication requested but BrowserCredentialsMiddleware is unavailable; continuing without auth')
-else:
-    logger.info('Authentication disabled; middleware not installed')
 
 # Initialize and register CloudWatch tools
 try:
@@ -48,8 +30,10 @@ except Exception as e:
     raise
 
 
+"""Run the MCP server."""
+
+
 def main():
-    """Run the MCP server."""
     logger.info('Initializing CloudWatch MCP server...')
     logger.info('AWS_PROFILE=%s  AWS_REGION=%s', os.getenv('AWS_PROFILE'), os.getenv('AWS_REGION'))
     host = os.getenv('CLOUDWATCH_MCP_SERVER_HOST', '0.0.0.0')

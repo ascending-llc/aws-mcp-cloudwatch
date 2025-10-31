@@ -574,3 +574,13 @@ src/openapi-mcp-server/*.txt
 src/openapi-mcp-server/*-coverage.xml
 src/openapi-mcp-server/junit.xml
 executive-summary.md
+
+# Claude Code specific ignores
+.claude/
+CLAUDE.md
+**/CLAUDE.md
+
+# AWS credential files (security)
+*creds*.json
+cloudwatch-*.json
+raw_creds.json

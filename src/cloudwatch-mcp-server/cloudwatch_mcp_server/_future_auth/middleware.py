@@ -1,15 +1,167 @@
 """Authentication middleware for CloudWatch MCP Server."""
 
+import base64
+import json
 import os
-from typing import Optional
-import boto3
-import jwt
-from jwt import PyJWKClient
+import time
 from loguru import logger
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from typing import Optional
 
+
+class BrowserCredentialsMiddleware:
+    """Middleware for browser-stored AWS credentials (generic for any AWS account).
+
+    This middleware accepts temporary AWS credentials via two methods:
+    1. OAuth Bearer token (from OAuth bridge server) - Recommended for LibreChat
+    2. X-AWS-Credentials header (legacy browser-based auth)
+
+    Both methods send base64-encoded JSON containing AWS credentials from:
+    - aws sts get-session-token (IAM users)
+    - aws configure export-credentials (SSO users)
+
+    This approach works for:
+    - users without IAM Identity Center
+    - External client
+    - Testing and development
+    - Multi-account flexible
+    """
+
+    def __init__(self, app, enable_auth: Optional[bool] = None):
+        """Initialize the middleware.
+
+        Args:
+            app: The ASGI application
+            enable_auth: Whether to enable authentication
+        """
+        self.app = app
+        if enable_auth is None:
+            enable_auth = os.getenv('ENABLE_AUTH', 'true').lower() == 'true'
+        self.enable_auth = enable_auth
+
+        if self.enable_auth:
+            logger.info('Browser credentials middleware initialized')
+        else:
+            logger.warning('Browser credentials middleware running in DISABLED mode')
+
+    async def __call__(self, scope, receive, send):
+        """ASGI middleware implementation.
+
+        Args:
+            scope: ASGI scope dict
+            receive: ASGI receive callable
+            send: ASGI send callable
+        """
+        if scope['type'] != 'http':
+            await self.app(scope, receive, send)
+            return
+
+        # Create request from scope to access headers and path
+        request = Request(scope, receive)
+
+        # Skip auth for health checks and non-MCP endpoints
+        if request.url.path in ['/health', '/']:
+            await self.app(scope, receive, send)
+            return
+
+        # If auth is disabled, proceed without validation
+        if not self.enable_auth:
+            logger.debug('Auth disabled, skipping validation')
+            await self.app(scope, receive, send)
+            return
+
+        # Extract credentials from Authorization header (OAuth) or X-AWS-Credentials header (browser)
+        creds_header = None
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            # OAuth Bearer token from LibreChat OAuth flow
+            creds_header = auth_header.replace('Bearer ', '').strip()
+            logger.info('Using OAuth Bearer token')
+        else:
+            # Legacy X-AWS-Credentials header for browser-based auth
+            creds_header = request.headers.get('X-AWS-Credentials')
+            if creds_header:
+                logger.info('Using X-AWS-Credentials header')
+
+        if not creds_header:
+            logger.warning(
+                'Missing AWS credentials (no Authorization or X-AWS-Credentials header)'
+            )
+            response = JSONResponse(
+                status_code=401,
+                content={'error': 'Missing AWS credentials. Please authorize CloudWatch MCP.'},
+            )
+            await response(scope, receive, send)
+            return
+
+        try:
+            # Decode base64-encoded credentials
+            credentials_json = base64.b64decode(creds_header).decode('utf-8')
+            credentials = json.loads(credentials_json)
+
+            # Validate required fields
+            required_fields = ['accessKeyId', 'secretAccessKey', 'sessionToken']
+            missing = [f for f in required_fields if f not in credentials]
+            if missing:
+                raise ValueError(f'Missing required credential fields: {", ".join(missing)}')
+
+            # Check if credentials are expired
+            if 'expiresAt' in credentials:
+                if credentials['expiresAt'] < time.time() * 1000:  # expiresAt is in milliseconds
+                    logger.warning('Credentials have expired')
+                    response = JSONResponse(
+                        status_code=401,
+                        content={'error': 'AWS credentials have expired. Please re-authorize.'},
+                    )
+                    await response(scope, receive, send)
+                    return
+
+            # Attach credentials to scope state for downstream handlers
+            if 'state' not in scope:
+                scope['state'] = {}
+
+            scope['state']['aws_credentials'] = {
+                'access_key_id': credentials['accessKeyId'],
+                'secret_access_key': credentials['secretAccessKey'],
+                'session_token': credentials['sessionToken'],
+                'expiration': credentials.get('expiresAt'),
+                'account_id': credentials.get('accountId', 'unknown'),
+            }
+            scope['state']['user_email'] = f'aws-account-{credentials.get("accountId", "unknown")}'
+
+            logger.info(
+                f'Authenticated browser credentials for account: {credentials.get("accountId", "unknown")}'
+            )
+
+            # Proceed to next handler
+            await self.app(scope, receive, send)
+
+        except base64.binascii.Error:
+            logger.warning('Invalid base64 encoding in credentials')
+            response = JSONResponse(
+                status_code=401, content={'error': 'Invalid credentials encoding'}
+            )
+            await response(scope, receive, send)
+        except json.JSONDecodeError:
+            logger.warning('Invalid JSON in credentials')
+            response = JSONResponse(
+                status_code=401, content={'error': 'Invalid credentials format'}
+            )
+            await response(scope, receive, send)
+        except ValueError as e:
+            logger.warning(f'Credential validation error: {str(e)}')
+            response = JSONResponse(status_code=401, content={'error': str(e)})
+            await response(scope, receive, send)
+        except Exception as e:
+            logger.error(f'Browser credentials auth error: {str(e)}')
+            response = JSONResponse(status_code=500, content={'error': 'Authentication failed'})
+            await response(scope, receive, send)
+
+
+'''
+
+oauth and other implementations, leaving for now
 
 class CognitoAuthMiddleware(BaseHTTPMiddleware):
     """Middleware to validate Cognito JWT tokens and provide AWS credentials.
@@ -192,7 +344,11 @@ class IAMIdentityCenterMiddleware(BaseHTTPMiddleware):
     """Middleware for AWS IAM Identity Center (formerly AWS SSO) authentication.
 
     This middleware validates OIDC tokens from IAM Identity Center and
-    assumes the appropriate IAM role for CloudWatch access.
+    extracts AWS credentials directly from JWT custom claims.
+
+    IAM Identity Center custom attribute mappings embed temporary AWS credentials
+    (access key, secret key, session token) in the JWT token, eliminating the need
+    for AssumeRole calls. This is the recommended approach for LibreChat MCP OAuth.
     """
 
     def __init__(self, app, enable_auth: Optional[bool] = None):
@@ -210,7 +366,6 @@ class IAMIdentityCenterMiddleware(BaseHTTPMiddleware):
         self.region = os.getenv('AWS_IDENTITY_CENTER_REGION', 'us-east-1')
         self.issuer = os.getenv('AWS_IDENTITY_CENTER_ISSUER')
         self.client_id = os.getenv('AWS_IDENTITY_CENTER_CLIENT_ID')
-        self.role_arn = os.getenv('AWS_CLOUDWATCH_ROLE_ARN')
 
         if self.enable_auth and self.issuer:
             jwks_url = f"{self.issuer}/.well-known/jwks.json"
@@ -243,8 +398,8 @@ class IAMIdentityCenterMiddleware(BaseHTTPMiddleware):
             # Verify token
             token_payload = await self._verify_token(token)
 
-            # Assume role using the token
-            aws_credentials = await self._assume_role(token_payload)
+            # Extract AWS credentials from JWT custom claims
+            aws_credentials = await self._extract_credentials_from_token(token_payload)
 
             # Attach to request state
             request.state.aws_credentials = aws_credentials
@@ -276,27 +431,54 @@ class IAMIdentityCenterMiddleware(BaseHTTPMiddleware):
 
         return payload
 
-    async def _assume_role(self, token_payload: dict) -> dict:
-        """Assume IAM role for CloudWatch access."""
-        sts_client = boto3.client('sts', region_name=self.region)
+    async def _extract_credentials_from_token(self, token_payload: dict) -> dict:
+        """Extract AWS credentials from IAM Identity Center JWT token.
 
-        # Use role ARN from env or from token custom claim
-        role_arn = self.role_arn or token_payload.get('custom:role_arn')
+        IAM Identity Center custom attribute mappings embed AWS credentials
+        directly in the JWT token via ${session:access_key_id}, ${session:secret_access_key},
+        and ${session:session_token} custom claims.
 
-        if not role_arn:
-            raise ValueError("No role ARN configured")
+        This is the recommended approach for LibreChat MCP OAuth integration.
 
-        response = sts_client.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName=f"cloudwatch-mcp-{token_payload.get('sub')[:32]}",
-            DurationSeconds=3600
-        )
+        Args:
+            token_payload: Decoded JWT token payload with custom claims
+
+        Returns:
+            Dictionary with AWS credentials:
+                - access_key_id: AWS access key from jwt claim
+                - secret_access_key: AWS secret key from jwt claim
+                - session_token: AWS session token from jwt claim
+                - expiration: Token expiration timestamp
+
+        Raises:
+            ValueError: If required credential claims are missing from token
+        """
+        # Extract credentials from custom claims configured in IAM Identity Center
+        access_key = token_payload.get('aws_access_key_id')
+        secret_key = token_payload.get('aws_secret_access_key')
+        session_token = token_payload.get('aws_session_token')
+
+        if not (access_key and secret_key and session_token):
+            missing = []
+            if not access_key:
+                missing.append('aws_access_key_id')
+            if not secret_key:
+                missing.append('aws_secret_access_key')
+            if not session_token:
+                missing.append('aws_session_token')
+            raise ValueError(
+                f"JWT token missing required AWS credential claims: {', '.join(missing)}. "
+                "Ensure IAM Identity Center application has custom attribute mappings configured."
+            )
+
+        logger.debug(f"Successfully extracted AWS credentials from JWT token for account: {token_payload.get('aws_account_id', 'unknown')}")
 
         return {
-            'access_key_id': response['Credentials']['AccessKeyId'],
-            'secret_access_key': response['Credentials']['SecretAccessKey'],
-            'session_token': response['Credentials']['SessionToken'],
-            'expiration': response['Credentials']['Expiration']
+            'access_key_id': access_key,
+            'secret_access_key': secret_key,
+            'session_token': session_token,
+            'expiration': token_payload.get('exp'),
+            'account_id': token_payload.get('aws_account_id')
         }
 
 
@@ -391,3 +573,7 @@ class OIDCMiddleware(BaseHTTPMiddleware):
             'session_token': response['Credentials']['SessionToken'],
             'expiration': response['Credentials']['Expiration']
         }
+
+
+
+'''

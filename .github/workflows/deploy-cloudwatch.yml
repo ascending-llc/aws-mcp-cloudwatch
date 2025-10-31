@@ -100,13 +100,20 @@ jobs:
           echo "Updating env vars in EKS pods..."
           kubectl annotate es jarvis-env force-sync=$(date +%s) --overwrite -n ${{ inputs.application }}
 
+      - name: Apply service account with IRSA
+        run: |
+          # Apply service account with IAM role annotation for IRSA
+          kubectl apply -f k8s/jarvis-demo/service-account.yaml
+
       - name: Apply deployment manifest
         run: |
-          # Using no-auth deployment for testing
-          kubectl apply -f k8s/jarvis-demo/deployment-no-auth.yaml
+          # Using env-auth deployment with IRSA (IAM Roles for Service Accounts)
+          kubectl apply -f k8s/jarvis-demo/deployment-env-auth.yaml
 
-          # Uncomment below when auth is implemented and comment out no-auth above
-          # kubectl apply -f k8s/jarvis-demo/deployment.yaml
+          # Alternative deployments (uncomment as needed):
+          # kubectl apply -f k8s/jarvis-demo/deployment-no-auth.yaml  # For testing without IRSA
+          # kubectl apply -f k8s/jarvis-demo/deployment-oauth.yaml     # For per-user OAuth
+          # kubectl apply -f k8s/jarvis-demo/deployment-browser-auth.yaml  # For browser auth
 
       - name: Update deployment on EKS
         env:
