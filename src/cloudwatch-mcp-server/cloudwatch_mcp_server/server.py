@@ -1,11 +1,10 @@
 import os
-
 from cloudwatch_mcp_server.cloudwatch_alarms.tools import CloudWatchAlarmsTools
 from cloudwatch_mcp_server.cloudwatch_logs.tools import CloudWatchLogsTools
 from cloudwatch_mcp_server.cloudwatch_metrics.tools import CloudWatchMetricsTools
-from cloudwatch_mcp_server.middleware import IAMIdentityCenterMiddleware
-from loguru import logger
+from cloudwatch_mcp_server.middleware import BrowserCredentialsMiddleware
 from fastmcp import FastMCP
+from loguru import logger
 
 
 mcp = FastMCP(
@@ -18,8 +17,8 @@ mcp = FastMCP(
 enable_auth = os.getenv('ENABLE_AUTH', 'true').lower() == 'true'
 
 if enable_auth:
-    mcp.add_middleware(IAMIdentityCenterMiddleware(mcp, enable_auth=True))
-    logger.info('Authentication enabled')
+    mcp.add_middleware(BrowserCredentialsMiddleware(mcp, enable_auth=True))
+    logger.info('Browser credentials authentication enabled')
 else:
     logger.info('Authentication disabled; middleware not installed')
 
@@ -41,12 +40,22 @@ except Exception as e:
 
 def main():
     """Run the MCP server."""
-    logger.info("Initializing CloudWatch MCP server...")
-    logger.info("AWS_PROFILE=%s  AWS_REGION=%s", os.getenv("AWS_PROFILE"), os.getenv("AWS_REGION"))
-    host = os.getenv("CLOUDWATCH_MCP_SERVER_HOST", "0.0.0.0")
-    port = int(os.getenv("CLOUDWATCH_MCP_PORT", "3334"))
-    
-    mcp.run(transport="streamable-http", host=host, port=port)
+    logger.info('Initializing CloudWatch MCP server...')
+    logger.info('AWS_PROFILE=%s  AWS_REGION=%s', os.getenv('AWS_PROFILE'), os.getenv('AWS_REGION'))
+    host = os.getenv('CLOUDWATCH_MCP_SERVER_HOST', '0.0.0.0')
+    raw_port = os.getenv('CLOUDWATCH_MCP_PORT', '3334')
+
+    try:
+        port = int(raw_port)
+    except ValueError:
+        if raw_port.startswith('tcp://') and ':' in raw_port:
+            port = int(raw_port.rsplit(':', 1)[-1])
+            logger.warning('Normalized CLOUDWATCH_MCP_PORT %s to %s', raw_port, port)
+        else:
+            logger.warning('Invalid CLOUDWATCH_MCP_PORT %s, defaulting to 3334', raw_port)
+            port = 3334
+
+    mcp.run(transport='streamable-http', host=host, port=port)
 
     logger.info('CloudWatch MCP server started')
 
