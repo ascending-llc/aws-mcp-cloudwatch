@@ -19,7 +19,7 @@ CloudWatch MCP Server enables AI assistants to query and analyze AWS CloudWatch 
 
 ### Architecture
 
-CloudWatch MCP is deployed to EKS using **IRSA (IAM Roles for Service Accounts)** for secure, credential-free AWS authentication:
+CloudWatch MCP is deployed to EKS using **IRSA (IAM Roles for Service Accounts)** for secure, credential-free AWS authentication. The server runs in both production (`jarvis`) and demo (`jarvis-demo`) namespaces, sharing the same ECR image and IAM role.
 
 ```
 ┌─────────────────────────────────────┐
@@ -30,6 +30,7 @@ CloudWatch MCP is deployed to EKS using **IRSA (IAM Roles for Service Accounts)*
                ↓
 ┌─────────────────────────────────────┐
 │   CloudWatch MCP Server Pod         │
+│   Namespaces: jarvis, jarvis-demo   │
 │   Service Account: cloudwatch-mcp-  │
 │   service-account                   │
 └──────────────┬──────────────────────┘
@@ -39,13 +40,15 @@ CloudWatch MCP is deployed to EKS using **IRSA (IAM Roles for Service Accounts)*
 │   IAM Role:                         │
 │   CloudWatchMCPServerRole           │
 │   - CloudWatch Read Permissions     │
+│   - Wildcard namespace support      │
 └─────────────────────────────────────┘
 ```
 
 ### Configuration
 
-Deployed via [jarvis-deployment](https://github.com/your-org/jarvis-deployment) Terraform in `ascending/saas-account/terraform/jarvis-demo/values.yaml`:
+Deployed via [jarvis-deployment](https://github.com/your-org/jarvis-deployment) Terraform in both `ascending/saas-account/terraform/jarvis/values.yaml` and `ascending/saas-account/terraform/jarvis-demo/values.yaml`:
 
+**Infrastructure Configuration** (mcpConfigs):
 ```yaml
 mcpConfigs:
   - name: cloudwatch-mcp
@@ -53,6 +56,7 @@ mcpConfigs:
     image:
       repository: 897729109735.dkr.ecr.us-east-1.amazonaws.com/jarvis/cloudwatch_mcp_server
       tag: latest
+      pullPolicy: Always
     serviceAccount:
       name: cloudwatch-mcp-service-account
       annotations:
@@ -61,8 +65,7 @@ mcpConfigs:
       port: 3334
 ```
 
-Client configuration (Jarvis):
-
+**Client Configuration** (mcpServers):
 ```yaml
 mcpServers:
   cloudwatch:
@@ -73,12 +76,33 @@ mcpServers:
 
 ### Deployment Workflow
 
-1. **Build & Push**: GitHub Action builds Docker image → pushes to ECR
+1. **Build & Push**: GitHub Action (`.github/workflows/ci-cloudwatch.yml`) builds Docker image and pushes to ECR
 2. **Infrastructure**: Terraform in jarvis-deployment manages:
-   - IAM role (CloudWatchMCPServerRole)
-   - Service account with IRSA annotation
-   - Kubernetes deployment
+   - IAM role (CloudWatchMCPServerRole) with wildcard namespace trust policy
+   - Service accounts with IRSA annotations in both namespaces
+   - Kubernetes deployments in jarvis and jarvis-demo
 3. **Deploy**: Terraform apply pulls latest image from ECR
+4. **Update**: After new image push, manually restart deployments:
+   ```bash
+   kubectl rollout restart deployment/cloudwatch-mcp -n jarvis
+   kubectl rollout restart deployment/cloudwatch-mcp -n jarvis-demo
+   ```
+
+### Verifying Deployment
+
+Check deployment status:
+```bash
+# Check pods are running
+kubectl get pods -n jarvis -l app=cloudwatch-mcp
+kubectl get pods -n jarvis-demo -l app=cloudwatch-mcp
+
+# Verify IRSA configuration
+kubectl exec -n jarvis deployment/cloudwatch-mcp -- env | grep AWS_ROLE_ARN
+
+# Check CloudWatch access
+kubectl exec -n jarvis deployment/cloudwatch-mcp -- \
+  aws cloudwatch describe-alarms --max-records 1
+```
 
 ## Local Development
 
@@ -109,6 +133,7 @@ uv run cloudwatch_mcp_server
 | `AWS_REGION` | AWS region | `us-east-1` |
 | `AWS_PROFILE` | AWS profile (local dev) | - |
 | `CLOUDWATCH_MCP_PORT` | Server port | `3334` |
+| `CLOUDWATCH_MCP_SERVER_HOST` | Server host | `0.0.0.0` |
 | `FASTMCP_LOG_LEVEL` | Log level | `INFO` |
 
 ### Testing Locally
@@ -156,7 +181,8 @@ uv run pytest
 src/cloudwatch-mcp-server/
 ├── cloudwatch_mcp_server/
 │   ├── server.py              # Main entry point
-│   ├── middleware.py          # Auth middleware
+│   ├── __init__.py
+│   ├── _future_auth/          # Archived authentication middleware
 │   ├── cloudwatch_logs/       # Logs tools
 │   ├── cloudwatch_metrics/    # Metrics tools
 │   └── cloudwatch_alarms/     # Alarms tools
@@ -165,17 +191,23 @@ src/cloudwatch-mcp-server/
 └── Dockerfile                # Container image
 ```
 
+## Authentication
+
+**Current**: CloudWatch MCP uses IRSA (IAM Roles for Service Accounts) for AWS authentication. Authentication middleware implementations (OAuth, OIDC, Cognito) are archived in `src/cloudwatch-mcp-server/cloudwatch_mcp_server/_future_auth/` for potential future use but are not currently active.
+
 ## CI/CD
 
 ### GitHub Actions
 
 - **Build**: [`.github/workflows/ci-cloudwatch.yml`](.github/workflows/ci-cloudwatch.yml)
   - Builds multi-arch image (amd64/arm64)
-  - Pushes to ECR: `897729109735.dkr.ecr.us-east-1.amazonaws.com/jarvis/cloudwatch_mcp_server`
+  - Pushes to ECR: `897729109735.dkr.ecr.us-east-1.amazonaws.com/jarvis/cloudwatch_mcp_server:latest`
+  - Triggered on push to main or manual dispatch
 
 - **Deploy**: [`.github/workflows/deploy-cloudwatch.yml`](.github/workflows/deploy-cloudwatch.yml)
-  - Applies Kubernetes manifests
-  - Triggers pod rollout
+  - Applies Kubernetes service account with IRSA
+  - Applies deployment manifest to jarvis-demo namespace
+  - Note: Manual restart required for pods to pull new image
 
 ### Manual Deployment
 
@@ -183,7 +215,7 @@ Deployment is managed through Terraform in the `jarvis-deployment` repository:
 
 ```bash
 # In jarvis-deployment repo
-cd ascending/saas-account/terraform/jarvis-demo
+cd ascending/saas-account/terraform/jarvis
 
 # Pull latest changes
 git pull origin main
@@ -191,49 +223,42 @@ git pull origin main
 # Review changes
 terraform plan
 
-# Apply
+# Apply to both environments
 terraform apply
+
+# Restart pods to pull new image (if ECR image updated)
+kubectl rollout restart deployment/cloudwatch-mcp -n jarvis
+kubectl rollout restart deployment/cloudwatch-mcp -n jarvis-demo
 ```
 
 ## IAM Configuration
 
-The CloudWatch MCP server requires the following IAM permissions (managed via Terraform):
+The CloudWatch MCP server uses a shared IAM role across both namespaces. Reference policy files are available in the `iam/` directory.
 
-**Trust Policy** (IRSA):
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {
-      "Federated": "arn:aws:iam::897729109735:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/..."
-    },
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {
-      "StringLike": {
-        "oidc.eks....:sub": "system:serviceaccount:*:cloudwatch-mcp-service-account"
-      }
-    }
-  }]
-}
-```
+**Trust Policy** (IRSA with wildcard namespace):
+- File: [`iam/cloudwatch-mcp-trust-policy.json`](iam/cloudwatch-mcp-trust-policy.json)
+- Allows: `system:serviceaccount:*:cloudwatch-mcp-service-account`
+- Supports both jarvis and jarvis-demo namespaces
 
 **Permissions Policy**:
-- `cloudwatch:DescribeAlarms`
-- `cloudwatch:GetMetricData`
-- `cloudwatch:ListMetrics`
-- `logs:DescribeLogGroups`
-- `logs:FilterLogEvents`
-- `logs:GetLogEvents`
-- `logs:StartQuery`
-
-See [`iam/`](iam/) directory for reference policy templates.
+- File: [`iam/cloudwatch-mcp-permissions-policy.json`](iam/cloudwatch-mcp-permissions-policy.json)
+- CloudWatch permissions:
+  - `cloudwatch:DescribeAlarms`
+  - `cloudwatch:GetMetricData`
+  - `cloudwatch:ListMetrics`
+- CloudWatch Logs permissions:
+  - `logs:DescribeLogGroups`
+  - `logs:FilterLogEvents`
+  - `logs:GetLogEvents`
+  - `logs:StartQuery`
 
 ## Documentation
 
 - [Developer Guide](DEVELOPER_GUIDE.md) - Contributing and development
-- [Deployment Guide](docs/DEPLOYMENT.md) - Docker deployment options
-- [EKS Deployment](docs/DEPLOYMENT_EKS.md) - Kubernetes/EKS details
+- [Contributing Guidelines](CONTRIBUTING.md) - How to contribute
+- [Code of Conduct](CODE_OF_CONDUCT.md) - Community standards
+- [docs/CLAUDE.md](docs/CLAUDE.md) - AI assistant integration notes
+- [docs/authentication/](docs/authentication/) - Authentication implementation details
 
 ## Contributing
 
@@ -242,19 +267,22 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ### Development Workflow
 
 1. Create feature branch from `main`
-2. Make changes and test locally
-3. Build and test Docker image
-4. Create PR to `main`
-5. After merge, GitHub Actions builds and pushes to ECR
-6. Update Terraform in jarvis-deployment repo
-7. Apply Terraform changes to deploy
+2. Make changes and test locally with `uv run cloudwatch_mcp_server`
+3. Run tests: `uv run pytest`
+4. Build and test Docker image locally
+5. Create PR to `main`
+6. After merge, GitHub Actions builds and pushes to ECR
+7. Update Terraform in jarvis-deployment repo if config changes needed
+8. Apply Terraform changes to deploy
+9. Restart deployments to pull new image
 
 ## Security
 
-- Uses IRSA for AWS authentication (no static credentials)
-- Never commit credential files (enforced via `.gitignore`)
-- Follows AWS IAM least privilege principle
-- All secrets managed via AWS Secrets Manager
+- Uses IRSA for AWS authentication (no static credentials in pods)
+- IAM role follows least privilege principle (read-only CloudWatch access)
+- Credential files excluded via `.gitignore` (patterns: `*creds*.json`, `cloudwatch-*.json`)
+- Service account with IRSA annotation provides secure credential injection
+- No per-user authentication implemented (service-level access only)
 
 ## License
 

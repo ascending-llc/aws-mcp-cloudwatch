@@ -1,3 +1,6 @@
+
+#Legacy manual deploy, uses terraform for deployment to eks
+
 name: Deploy CloudWatch MCP to EKS
 on:
   workflow_dispatch:
