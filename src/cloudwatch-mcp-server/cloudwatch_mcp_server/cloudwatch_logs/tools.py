@@ -40,6 +40,15 @@ from mcp.server.fastmcp import Context
 from pydantic import Field
 from timeit import default_timer as timer
 from typing import Annotated, Dict, List, Literal, Optional
+import re
+
+# Configuration constants for query limits and truncation
+# These prevent MCP truncation errors by enforcing server-side limits
+MAX_QUERY_LIMIT = 2000  # Hard cap on number of results
+RECOMMENDED_QUERY_LIMIT = 500  # Soft limit - warning issued if exceeded
+DEFAULT_QUERY_LIMIT = 100  # Default when no limit specified
+MAX_FIELD_LENGTH = 5000  # Maximum characters per field value
+MAX_TOTAL_RESULT_SIZE_BYTES = 200000  # Maximum total response size (~200KB)
 
 
 class CloudWatchLogsTools:
@@ -122,7 +131,24 @@ class CloudWatchLogsTools:
         """
         return int(datetime.datetime.fromisoformat(time_str).timestamp())
 
-    def _build_logs_query_params(
+    def _extract_limit_from_query(self, query_string: str) -> Optional[int]:
+        """Extract limit value from query string if present.
+
+        Searches for '| limit N' pattern in the CloudWatch Logs Insights query string.
+
+        Args:
+            query_string: The query string to parse
+
+        Returns:
+            The limit value as integer if found, None otherwise
+        """
+        # Match "| limit N" pattern (case-insensitive, handles whitespace variations)
+        match = re.search(r'\|\s*limit\s+(\d+)', query_string, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+
+    async def _build_logs_query_params(
         self,
         log_group_names: Optional[List[str]],
         log_group_identifiers: Optional[List[str]],
@@ -130,8 +156,17 @@ class CloudWatchLogsTools:
         end_time: str,
         query_string: str,
         limit: Optional[int],
+        ctx: Context,
     ) -> Dict:
-        """Build parameters for CloudWatch Logs Insights query.
+        """Build parameters for CloudWatch Logs Insights query with enforced limits.
+
+        Validates and enforces query limits to prevent MCP truncation errors. The effective
+        limit is determined by taking the minimum of:
+        - The limit parameter
+        - Any limit specified in the query string (| limit N)
+        - MAX_QUERY_LIMIT (hard cap)
+
+        If no limit is specified, DEFAULT_QUERY_LIMIT is used.
 
         Args:
             log_group_names: List of log group names
@@ -140,17 +175,44 @@ class CloudWatchLogsTools:
             end_time: End time in ISO 8601 format
             query_string: CloudWatch Logs Insights query string
             limit: Maximum number of results to return
+            ctx: MCP context for warnings
 
         Returns:
-            Dictionary of parameters for the start_query API call
+            Dictionary of parameters for the start_query API call with enforced limit
         """
+        # Extract limit from query string if present
+        query_limit = self._extract_limit_from_query(query_string)
+
+        # Determine effective limit
+        limits_to_consider = [l for l in [limit, query_limit] if l is not None]
+
+        if limits_to_consider:
+            # Use minimum of all specified limits, capped at MAX_QUERY_LIMIT
+            effective_limit = min(min(limits_to_consider), MAX_QUERY_LIMIT)
+        else:
+            # No limit specified, use default
+            effective_limit = DEFAULT_QUERY_LIMIT
+            logger.info(f'No limit specified in query or parameters, using default: {DEFAULT_QUERY_LIMIT}')
+
+        # Issue warning if limit exceeds recommended threshold
+        if effective_limit > RECOMMENDED_QUERY_LIMIT:
+            await ctx.warning(
+                f'Query limit {effective_limit} exceeds recommended limit of {RECOMMENDED_QUERY_LIMIT}. '
+                f'Large result sets may be truncated to prevent MCP errors. '
+                f'Consider using more specific filters or a smaller limit.'
+            )
+
+        logger.info(
+            f'Query limit enforcement - param: {limit}, query: {query_limit}, effective: {effective_limit}'
+        )
+
         return {
             'startTime': self._convert_time_to_timestamp(start_time),
             'endTime': self._convert_time_to_timestamp(end_time),
             'queryString': query_string,
             'logGroupIdentifiers': log_group_identifiers,
             'logGroupNames': log_group_names,
-            'limit': limit,
+            'limit': effective_limit,
         }
 
     def _process_query_results(self, response: Dict, query_id: str = '') -> Dict:
@@ -173,6 +235,94 @@ class CloudWatchLogsTools:
             ],
         }
 
+    async def _process_query_results_with_truncation(
+        self, response: Dict, query_id: str = '', ctx: Optional[Context] = None
+    ) -> Dict:
+        """Process query results with adaptive truncation to prevent MCP errors.
+
+        Implements multi-layer truncation strategy:
+        1. Individual fields exceeding MAX_FIELD_LENGTH are truncated with markers
+        2. Results are processed until total size exceeds MAX_TOTAL_RESULT_SIZE_BYTES
+        3. Truncation metadata is included to show what was omitted
+
+        Args:
+            response: Raw response from get_query_results API
+            query_id: The query ID to include in the response
+            ctx: MCP context for warnings (optional)
+
+        Returns:
+            Processed query results dictionary with truncation metadata
+        """
+        raw_results = response.get('results', [])
+        processed_results = []
+        total_size_bytes = 0
+
+        # Track truncation statistics
+        truncation_metadata = {
+            'field_truncations': 0,
+            'results_truncated': False,
+            'total_results_available': len(raw_results),
+            'results_returned': 0,
+        }
+
+        for line in raw_results:
+            result_obj = {}
+            result_size = 0
+
+            # Process each field with truncation
+            for field in line:
+                field_name = field['field']
+                field_value = field['value']
+
+                # Truncate individual field if it exceeds max length
+                if len(field_value) > MAX_FIELD_LENGTH:
+                    chars_omitted = len(field_value) - MAX_FIELD_LENGTH
+                    truncated_value = field_value[:MAX_FIELD_LENGTH]
+                    truncated_value += f'\n[TRUNCATED: {chars_omitted} chars omitted]'
+                    result_obj[field_name] = truncated_value
+                    truncation_metadata['field_truncations'] += 1
+                    logger.debug(
+                        f'Truncated field {field_name} from {len(field_value)} to {MAX_FIELD_LENGTH} chars'
+                    )
+                else:
+                    result_obj[field_name] = field_value
+
+                result_size += len(str(result_obj[field_name]))
+
+            # Check if adding this result would exceed total size budget
+            if total_size_bytes + result_size > MAX_TOTAL_RESULT_SIZE_BYTES:
+                truncation_metadata['results_truncated'] = True
+                logger.warning(
+                    f'Result size limit reached: {total_size_bytes} bytes. '
+                    f'Truncating remaining results ({len(raw_results) - len(processed_results)} omitted).'
+                )
+                break
+
+            processed_results.append(result_obj)
+            total_size_bytes += result_size
+            truncation_metadata['results_returned'] += 1
+
+        # Log warnings if truncation occurred
+        if truncation_metadata['results_truncated'] and ctx:
+            await ctx.warning(
+                f"Results truncated due to size limits: returned {truncation_metadata['results_returned']} "
+                f"of {truncation_metadata['total_results_available']} results "
+                f"({total_size_bytes} bytes). Consider using more specific filters or a smaller limit."
+            )
+
+        if truncation_metadata['field_truncations'] > 0:
+            logger.info(
+                f"Truncated {truncation_metadata['field_truncations']} fields exceeding {MAX_FIELD_LENGTH} chars"
+            )
+
+        return {
+            'queryId': query_id or response.get('queryId', ''),
+            'status': response['status'],
+            'statistics': response.get('statistics', {}),
+            'results': processed_results,
+            'truncation_metadata': truncation_metadata,
+        }
+
     async def _poll_for_query_completion(
         self, logs_client, query_id: str, max_timeout: int, ctx: Context
     ) -> Dict:
@@ -185,7 +335,7 @@ class CloudWatchLogsTools:
             ctx: MCP context for warnings
 
         Returns:
-            Query results dictionary or timeout message
+            Query results dictionary with truncation protection or timeout message
         """
         poll_start = timer()
         while poll_start + max_timeout > timer():
@@ -194,7 +344,7 @@ class CloudWatchLogsTools:
 
             if status in {'Complete', 'Failed', 'Cancelled'}:
                 logger.info(f'Query {query_id} finished with status {status}')
-                return self._process_query_results(response, query_id)
+                return await self._process_query_results_with_truncation(response, query_id, ctx)
 
             await asyncio.sleep(1)
 
@@ -535,7 +685,7 @@ class CloudWatchLogsTools:
         limit: Annotated[
             int | None,
             Field(
-                description='The maximum number of log events to return. It is critical to use either this parameter or a `| limit <int>` operator in the query to avoid consuming too many tokens of the agent.'
+                description='The maximum number of log events to return. If not specified, defaults to 100. Maximum allowed is 2000. If both this parameter and `| limit <int>` in the query are specified, the more restrictive limit is enforced.'
             ),
         ] = None,
         max_timeout: Annotated[
@@ -549,12 +699,22 @@ class CloudWatchLogsTools:
             Field(description='AWS region to query. Defaults to us-east-1.'),
         ] = 'us-east-1',
     ) -> Dict:
-        """Executes a CloudWatch Logs Insights query and waits for the results to be available.
+        """Executes a CloudWatch Logs Insights query with automatic limit enforcement and adaptive truncation.
 
         IMPORTANT: The operation must include exactly one of the following parameters: log_group_names, or log_group_identifiers.
 
-        CRITICAL: The volume of returned logs can easily overwhelm the agent context window. Always include a limit in the query
-        (| limit 50) or using the limit parameter.
+        LIMIT ENFORCEMENT:
+        - If no limit is specified, a default limit of 100 is applied
+        - Maximum query limit is 2000 results (hard cap)
+        - Recommended limit is 500 results (warning issued if exceeded)
+        - If both query string (| limit N) and limit parameter are specified, the more restrictive limit is used
+
+        ADAPTIVE TRUNCATION:
+        Results are protected against MCP truncation errors through multi-layer truncation:
+        - Individual fields exceeding 5000 characters are truncated with [TRUNCATED: N chars] markers
+        - Total response size is capped at ~200KB to prevent JSON truncation errors
+        - Truncation metadata is included in the response showing what was omitted
+        - Warnings are issued if truncation occurs
 
         Usage: Use to query, filter, collect statistics, or find patterns in one or more log groups. For example, the following
         query lists exceptions per hour.
@@ -567,19 +727,23 @@ class CloudWatchLogsTools:
 
         Returns:
         --------
-            A dictionary containing the final query results, including:
+            A dictionary containing the query results with truncation protection, including:
                 - status: The current status of the query (e.g., Scheduled, Running, Complete, Failed, etc.)
-                - results: A list of the actual query results if the status is Complete.
+                - results: A list of the actual query results (may be truncated for size)
                 - statistics: Query performance statistics
-                - messages: Any informational messages about the query
+                - truncation_metadata: Information about any truncation that occurred
+                    - field_truncations: Number of fields truncated for length
+                    - results_truncated: Whether result set was truncated for size
+                    - total_results_available: Total results from query
+                    - results_returned: Number of results actually returned
         """
         try:
             # Validate parameters
             self._validate_log_group_parameters(log_group_names, log_group_identifiers)
 
-            # Build query parameters
-            kwargs = self._build_logs_query_params(
-                log_group_names, log_group_identifiers, start_time, end_time, query_string, limit
+            # Build query parameters with enforced limits
+            kwargs = await self._build_logs_query_params(
+                log_group_names, log_group_identifiers, start_time, end_time, query_string, limit, ctx
             )
 
             # Create logs client for the specified region
@@ -590,7 +754,7 @@ class CloudWatchLogsTools:
             query_id = start_response['queryId']
             logger.info(f'Started query with ID: {query_id}')
 
-            # Poll for completion
+            # Poll for completion with truncation protection
             return await self._poll_for_query_completion(logs_client, query_id, max_timeout, ctx)
 
         except Exception as e:
