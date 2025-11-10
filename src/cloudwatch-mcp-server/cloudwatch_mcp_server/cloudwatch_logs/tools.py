@@ -261,7 +261,6 @@ class CloudWatchLogsTools:
         raw_results = response.get('results', [])
         processed_results = []
         total_size_bytes = 0
-        warnings = []
 
         # Track truncation statistics
         truncation_metadata = {
@@ -308,14 +307,6 @@ class CloudWatchLogsTools:
             total_size_bytes += result_size
             truncation_metadata['results_returned'] += 1
 
-        # Build warning messages if truncation occurred
-        if truncation_metadata['results_truncated']:
-            warnings.append(
-                f'Results truncated due to size limits: returned {truncation_metadata["results_returned"]} '
-                f'of {truncation_metadata["total_results_available"]} results '
-                f'({total_size_bytes} bytes). Consider using more specific filters or a smaller limit.'
-            )
-
         if truncation_metadata['field_truncations'] > 0:
             logger.info(
                 f'Truncated {truncation_metadata["field_truncations"]} fields exceeding {MAX_FIELD_LENGTH} chars'
@@ -327,7 +318,6 @@ class CloudWatchLogsTools:
             'statistics': response.get('statistics', {}),
             'results': processed_results,
             'truncation_metadata': truncation_metadata,
-            'warnings': warnings,
         }
 
     async def _poll_for_query_completion(
@@ -353,9 +343,14 @@ class CloudWatchLogsTools:
                 logger.info(f'Query {query_id} finished with status {status}')
                 result = await self._process_query_results_with_truncation(response, query_id)
 
-                # Issue any warnings from the truncation process
-                for warning in result.get('warnings', []):
-                    await ctx.warning(warning)
+                # Issue warnings based on truncation metadata
+                metadata = result.get('truncation_metadata', {})
+                if metadata.get('results_truncated'):
+                    await ctx.warning(
+                        f'Results truncated due to size limits: returned {metadata["results_returned"]} '
+                        f'of {metadata["total_results_available"]} results. '
+                        'Consider using more specific filters or a smaller limit.'
+                    )
 
                 return result
 
