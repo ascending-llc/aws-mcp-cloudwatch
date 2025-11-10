@@ -321,18 +321,17 @@ class CloudWatchLogsTools:
         }
 
     async def _poll_for_query_completion(
-        self, logs_client, query_id: str, max_timeout: int, ctx: Context
-    ) -> Dict:
+        self, logs_client, query_id: str, max_timeout: int
+    ) -> Tuple[Dict, Optional[str]]:
         """Poll for query completion within the specified timeout.
 
         Args:
             logs_client: The CloudWatch Logs client to use
             query_id: The query ID to poll for
             max_timeout: Maximum time to wait in seconds
-            ctx: MCP context for warnings
 
         Returns:
-            Query results dictionary with truncation protection or timeout message
+            Tuple of (query results dictionary with truncation protection, warning message or None)
         """
         poll_start = timer()
         while poll_start + max_timeout > timer():
@@ -343,27 +342,27 @@ class CloudWatchLogsTools:
                 logger.info(f'Query {query_id} finished with status {status}')
                 result = await self._process_query_results_with_truncation(response, query_id)
 
-                # Issue warnings based on truncation metadata
+                # Build warning message if truncation occurred
+                warning_message = None
                 metadata = result.get('truncation_metadata', {})
                 if metadata.get('results_truncated'):
-                    await ctx.warning(
+                    warning_message = (
                         f'Results truncated due to size limits: returned {metadata["results_returned"]} '
                         f'of {metadata["total_results_available"]} results. '
                         'Consider using more specific filters or a smaller limit.'
                     )
 
-                return result
+                return result, warning_message
 
             await asyncio.sleep(1)
 
         msg = f'Query {query_id} did not complete within {max_timeout} seconds. Use get_logs_insight_query_results with the returned queryId to try again to retrieve query results.'
         logger.warning(msg)
-        await ctx.warning(msg)
         return {
             'queryId': query_id,
             'status': 'Polling Timeout',
             'message': msg,
-        }
+        }, msg
 
     def register(self, mcp):
         """Register all CloudWatch Logs tools with the MCP server."""
@@ -772,7 +771,13 @@ class CloudWatchLogsTools:
             logger.info(f'Started query with ID: {query_id}')
 
             # Poll for completion with truncation protection
-            return await self._poll_for_query_completion(logs_client, query_id, max_timeout, ctx)
+            result, truncation_warning = await self._poll_for_query_completion(logs_client, query_id, max_timeout)
+
+            # Issue truncation warning if present
+            if truncation_warning:
+                await ctx.warning(truncation_warning)
+
+            return result
 
         except Exception as e:
             logger.error(f'Error in execute_log_insights_query_tool: {str(e)}')
