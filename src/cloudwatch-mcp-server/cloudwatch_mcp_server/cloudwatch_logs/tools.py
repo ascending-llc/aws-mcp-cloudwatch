@@ -18,6 +18,8 @@ import asyncio
 import boto3
 import datetime
 import os
+import re
+from botocore.config import Config
 from cloudwatch_mcp_server import MCP_SERVER_VERSION
 from cloudwatch_mcp_server.cloudwatch_logs.models import (
     LogAnomaly,
@@ -34,13 +36,12 @@ from cloudwatch_mcp_server.common import (
     filter_by_prefixes,
     remove_null_values,
 )
-from botocore.config import Config
 from loguru import logger
 from mcp.server.fastmcp import Context
 from pydantic import Field
 from timeit import default_timer as timer
-from typing import Annotated, Dict, List, Literal, Optional
-import re
+from typing import Annotated, Dict, List, Literal, Optional, Tuple
+
 
 # Configuration constants for query limits and truncation
 # These prevent MCP truncation errors by enforcing server-side limits
@@ -87,9 +88,11 @@ class CloudWatchLogsTools:
                     aws_access_key_id=creds['access_key_id'],
                     aws_secret_access_key=creds['secret_access_key'],
                     aws_session_token=creds['session_token'],
-                    region_name=region
+                    region_name=region,
                 )
-                logger.info(f"Using authenticated credentials for user: {getattr(request_state, 'user_email', 'unknown')}")
+                logger.info(
+                    f'Using authenticated credentials for user: {getattr(request_state, "user_email", "unknown")}'
+                )
                 return session.client('logs', config=config)
 
             # Fall back to profile-based auth for local development
@@ -156,8 +159,7 @@ class CloudWatchLogsTools:
         end_time: str,
         query_string: str,
         limit: Optional[int],
-        ctx: Context,
-    ) -> Dict:
+    ) -> Tuple[Dict, Optional[str]]:
         """Build parameters for CloudWatch Logs Insights query with enforced limits.
 
         Validates and enforces query limits to prevent MCP truncation errors. The effective
@@ -175,10 +177,9 @@ class CloudWatchLogsTools:
             end_time: End time in ISO 8601 format
             query_string: CloudWatch Logs Insights query string
             limit: Maximum number of results to return
-            ctx: MCP context for warnings
 
         Returns:
-            Dictionary of parameters for the start_query API call with enforced limit
+            Tuple of (parameters dict, warning message or None)
         """
         # Extract limit from query string if present
         query_limit = self._extract_limit_from_query(query_string)
@@ -192,11 +193,14 @@ class CloudWatchLogsTools:
         else:
             # No limit specified, use default
             effective_limit = DEFAULT_QUERY_LIMIT
-            logger.info(f'No limit specified in query or parameters, using default: {DEFAULT_QUERY_LIMIT}')
+            logger.info(
+                f'No limit specified in query or parameters, using default: {DEFAULT_QUERY_LIMIT}'
+            )
 
-        # Issue warning if limit exceeds recommended threshold
+        # Build warning message if limit exceeds recommended threshold
+        warning_message = None
         if effective_limit > RECOMMENDED_QUERY_LIMIT:
-            await ctx.warning(
+            warning_message = (
                 f'Query limit {effective_limit} exceeds recommended limit of {RECOMMENDED_QUERY_LIMIT}. '
                 f'Large result sets may be truncated to prevent MCP errors. '
                 f'Consider using more specific filters or a smaller limit.'
@@ -206,7 +210,7 @@ class CloudWatchLogsTools:
             f'Query limit enforcement - param: {limit}, query: {query_limit}, effective: {effective_limit}'
         )
 
-        return {
+        params = {
             'startTime': self._convert_time_to_timestamp(start_time),
             'endTime': self._convert_time_to_timestamp(end_time),
             'queryString': query_string,
@@ -214,6 +218,8 @@ class CloudWatchLogsTools:
             'logGroupNames': log_group_names,
             'limit': effective_limit,
         }
+
+        return params, warning_message
 
     def _process_query_results(self, response: Dict, query_id: str = '') -> Dict:
         """Process query results response into standardized format.
@@ -236,7 +242,7 @@ class CloudWatchLogsTools:
         }
 
     async def _process_query_results_with_truncation(
-        self, response: Dict, query_id: str = '', ctx: Optional[Context] = None
+        self, response: Dict, query_id: str = ''
     ) -> Dict:
         """Process query results with adaptive truncation to prevent MCP errors.
 
@@ -248,14 +254,14 @@ class CloudWatchLogsTools:
         Args:
             response: Raw response from get_query_results API
             query_id: The query ID to include in the response
-            ctx: MCP context for warnings (optional)
 
         Returns:
-            Processed query results dictionary with truncation metadata
+            Processed query results dictionary with truncation metadata and warnings
         """
         raw_results = response.get('results', [])
         processed_results = []
         total_size_bytes = 0
+        warnings = []
 
         # Track truncation statistics
         truncation_metadata = {
@@ -302,17 +308,17 @@ class CloudWatchLogsTools:
             total_size_bytes += result_size
             truncation_metadata['results_returned'] += 1
 
-        # Log warnings if truncation occurred
-        if truncation_metadata['results_truncated'] and ctx:
-            await ctx.warning(
-                f"Results truncated due to size limits: returned {truncation_metadata['results_returned']} "
-                f"of {truncation_metadata['total_results_available']} results "
-                f"({total_size_bytes} bytes). Consider using more specific filters or a smaller limit."
+        # Build warning messages if truncation occurred
+        if truncation_metadata['results_truncated']:
+            warnings.append(
+                f'Results truncated due to size limits: returned {truncation_metadata["results_returned"]} '
+                f'of {truncation_metadata["total_results_available"]} results '
+                f'({total_size_bytes} bytes). Consider using more specific filters or a smaller limit.'
             )
 
         if truncation_metadata['field_truncations'] > 0:
             logger.info(
-                f"Truncated {truncation_metadata['field_truncations']} fields exceeding {MAX_FIELD_LENGTH} chars"
+                f'Truncated {truncation_metadata["field_truncations"]} fields exceeding {MAX_FIELD_LENGTH} chars'
             )
 
         return {
@@ -321,6 +327,7 @@ class CloudWatchLogsTools:
             'statistics': response.get('statistics', {}),
             'results': processed_results,
             'truncation_metadata': truncation_metadata,
+            'warnings': warnings,
         }
 
     async def _poll_for_query_completion(
@@ -344,7 +351,13 @@ class CloudWatchLogsTools:
 
             if status in {'Complete', 'Failed', 'Cancelled'}:
                 logger.info(f'Query {query_id} finished with status {status}')
-                return await self._process_query_results_with_truncation(response, query_id, ctx)
+                result = await self._process_query_results_with_truncation(response, query_id)
+
+                # Issue any warnings from the truncation process
+                for warning in result.get('warnings', []):
+                    await ctx.warning(warning)
+
+                return result
 
             await asyncio.sleep(1)
 
@@ -742,9 +755,18 @@ class CloudWatchLogsTools:
             self._validate_log_group_parameters(log_group_names, log_group_identifiers)
 
             # Build query parameters with enforced limits
-            kwargs = await self._build_logs_query_params(
-                log_group_names, log_group_identifiers, start_time, end_time, query_string, limit, ctx
+            kwargs, limit_warning = await self._build_logs_query_params(
+                log_group_names,
+                log_group_identifiers,
+                start_time,
+                end_time,
+                query_string,
+                limit,
             )
+
+            # Issue limit warning if present
+            if limit_warning:
+                await ctx.warning(limit_warning)
 
             # Create logs client for the specified region
             logs_client = self._get_logs_client(region, getattr(ctx, 'request_state', None))
