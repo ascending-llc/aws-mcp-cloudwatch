@@ -18,6 +18,7 @@ import asyncio
 import boto3
 import datetime
 import os
+from botocore.config import Config
 from cloudwatch_mcp_server import MCP_SERVER_VERSION
 from cloudwatch_mcp_server.cloudwatch_logs.models import (
     LogAnomaly,
@@ -34,7 +35,6 @@ from cloudwatch_mcp_server.common import (
     filter_by_prefixes,
     remove_null_values,
 )
-from botocore.config import Config
 from loguru import logger
 from mcp.server.fastmcp import Context
 from pydantic import Field
@@ -78,9 +78,11 @@ class CloudWatchLogsTools:
                     aws_access_key_id=creds['access_key_id'],
                     aws_secret_access_key=creds['secret_access_key'],
                     aws_session_token=creds['session_token'],
-                    region_name=region
+                    region_name=region,
                 )
-                logger.info(f"Using authenticated credentials for user: {getattr(request_state, 'user_email', 'unknown')}")
+                logger.info(
+                    f'Using authenticated credentials for user: {getattr(request_state, "user_email", "unknown")}'
+                )
                 return session.client('logs', config=config)
 
             # Fall back to profile-based auth for local development
@@ -200,7 +202,11 @@ class CloudWatchLogsTools:
 
         msg = f'Query {query_id} did not complete within {max_timeout} seconds. Use get_logs_insight_query_results with the returned queryId to try again to retrieve query results.'
         logger.warning(msg)
-        await ctx.warning(msg)
+        # Try to send warning to client, but don't fail if context doesn't support it (e.g., streamable-http)
+        try:
+            await ctx.warning(msg)
+        except (ValueError, AttributeError, RuntimeError) as e:
+            logger.debug(f'Could not send warning to client context: {e}')
         return {
             'queryId': query_id,
             'status': 'Polling Timeout',

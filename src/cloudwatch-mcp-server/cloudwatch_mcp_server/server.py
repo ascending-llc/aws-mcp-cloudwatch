@@ -14,6 +14,15 @@ mcp = FastMCP(
     instructions='Use this MCP server to run read-only commands and analyze CloudWatch Logs, Metrics, and Alarms. Supports discovering log groups, running CloudWatch Log Insight Queries, retrieving CloudWatch Metrics information, and getting active alarms with region information. With CloudWatch Logs Insights, you can interactively search and analyze your log data. With CloudWatch Metrics, you can get information about system and application metrics. With CloudWatch Alarms, you can retrieve all currently active alarms for operational awareness, with clear indication of which AWS region was checked.',
 )
 
+# Apply schema patch to work around FastMCP bug where additionalProperties
+# is generated as an object instead of a boolean
+# See: https://github.com/jlowin/fastmcp/issues/2459
+from cloudwatch_mcp_server.schema_patch import patch_fastmcp_schemas
+
+
+patch_fastmcp_schemas(mcp)
+logger.info('Applied FastMCP schema patch for additionalProperties')
+
 # Initialize and register CloudWatch tools
 try:
     cloudwatch_logs_tools = CloudWatchLogsTools()
@@ -31,6 +40,20 @@ except Exception as e:
 
 
 """Run the MCP server."""
+
+
+# Add health check endpoint for Kubernetes/monitoring probes
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+
+@mcp.custom_route('/health', methods=['GET'], include_in_schema=False)
+async def health_check(request: Request) -> JSONResponse:
+    """Health check endpoint."""
+    return JSONResponse({'status': 'ok'})
+
+
+logger.info('Added /health endpoint')
 
 
 def main():
